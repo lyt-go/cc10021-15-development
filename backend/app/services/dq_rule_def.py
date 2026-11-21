@@ -145,6 +145,61 @@ class DqRuleDefService(BaseModuleService):
 
         return result
 
+    def claim_batch_rules(self, receipt_no: str) -> dict[str, Any]:
+        """规则服务关联批量实例化回执，一次认领多条规则并回写待执行清单。
+
+        逐规则区分：字段已核实的规则进入待执行清单等待巡检；仍缺目标字段的表
+        只记录未补齐目标，不进入清单。认领动作不重复发布实例，仅做清单登记。
+        """
+        receipt = None
+        for row in store.rows("dq_inst_batch"):
+            if row.get("回执编号") == receipt_no:
+                receipt = row
+                break
+        if receipt is None:
+            return {"状态": "失败", "原因": f"回执{receipt_no}不存在"}
+
+        claimed: list[dict[str, Any]] = []
+        missing_targets: list[dict[str, Any]] = []
+
+        for detail in receipt.get("明细", []):
+            table_name = detail.get("目标表名")
+            if detail.get("校验状态") != "可执行" or not detail.get("规则编号"):
+                missing_targets.append({
+                    "目标表名": table_name,
+                    "缺失字段": detail.get("缺失字段", []),
+                })
+                continue
+
+            rule = next(
+                (r for r in store.rows(self.MODULE) if r.get("规则编号") == detail["规则编号"]),
+                None,
+            )
+            if rule is None:
+                missing_targets.append({"目标表名": table_name, "缺失字段": ["规则实例缺失"]})
+                continue
+
+            rule["待执行"] = True
+            rule["认领回执"] = receipt_no
+            claimed.append({
+                "规则编号": rule.get("规则编号"),
+                "目标表名": table_name,
+                "校验字段": rule.get("校验字段"),
+                "分区列": rule.get("分区列"),
+                "已核实字段": detail.get("已核实字段", []),
+            })
+
+        receipt["认领状态"] = "已认领"
+        receipt["认领规则数"] = len(claimed)
+
+        return {
+            "状态": "成功",
+            "回执编号": receipt_no,
+            "认领规则数": len(claimed),
+            "待执行清单": claimed,
+            "未补齐目标": missing_targets,
+        }
+
     def domain_snapshot(self) -> dict[str, Any]:
         snapshot = super().domain_snapshot()
         snapshot["operation"] = "校验"

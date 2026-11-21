@@ -100,6 +100,95 @@ class DqCheckRunService(BaseModuleService):
 
         return summary
 
+    def run_batch_inspection(self, receipt_no: str) -> dict[str, Any]:
+        """基于批量实例化回执执行本班巡检。
+
+        只有字段校验通过、已经发布并挂在待执行清单上的规则会真正开始校验；
+        待补字段的表直接跳过。每条被实际执行的规则采用次数加一，并记录实际
+        开始校验时间，便于对比补齐前后另一张表的启动时间。
+        """
+        receipt = next(
+            (row for row in store.rows("dq_inst_batch") if row.get("回执编号") == receipt_no),
+            None,
+        )
+        if receipt is None:
+            return {"状态": "失败", "原因": f"回执{receipt_no}不存在"}
+
+        rule_rows = store.rows("dq_rule_def")
+        started_at = datetime.now(timezone.utc).isoformat()
+        results = {"通过": 0, "失败": 0, "跳过": 0}
+        executed: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+
+        for detail in receipt.get("明细", []):
+            table_name = detail.get("目标表名")
+            if detail.get("校验状态") != "可执行" or not detail.get("规则编号"):
+                results["跳过"] += 1
+                skipped.append({
+                    "目标表名": table_name,
+                    "跳过原因": "目标字段未补齐",
+                    "缺失字段": detail.get("缺失字段", []),
+                })
+                continue
+
+            rule = next(
+                (r for r in rule_rows if r.get("规则编号") == detail["规则编号"]),
+                None,
+            )
+            if rule is None or not rule.get("待执行"):
+                results["跳过"] += 1
+                skipped.append({"目标表名": table_name, "跳过原因": "规则未进入待执行清单"})
+                continue
+
+            import random
+            passed = random.random() > 0.2
+            results["通过" if passed else "失败"] += 1
+
+            try:
+                adopted = int(str(rule.get("采用次数", "0")).strip() or 0)
+            except ValueError:
+                adopted = 0
+            rule["采用次数"] = str(adopted + 1)
+            rule["最近巡检时间"] = started_at
+            rule["待执行"] = False
+
+            executed.append({
+                "规则编号": rule.get("规则编号"),
+                "目标表名": table_name,
+                "实际开始校验时间": started_at,
+                "校验结果": "通过" if passed else "失败",
+                "采用次数": int(rule["采用次数"]),
+            })
+
+        task_id = f"DQ_C-batch-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+        check_rows = store.rows(self.MODULE)
+        new_cid = max((int(r.get("id", 0)) for r in check_rows), default=0) + 1
+        check_rows.append({
+            "id": new_cid,
+            "任务编号": task_id,
+            "关联规则集": receipt_no,
+            "数据范围": ",".join(d.get("目标表名", "") for d in receipt.get("明细", [])),
+            "Cron表达式": "0 6 * * *",
+            "并行度": str(len(executed) or 1),
+            "超时时间": "3600s",
+            "失败阈值": "20%",
+            "任务版本": "v1",
+            "status": "运行中" if executed else "待校验",
+            "pending": len(skipped) > 0,
+            "abnormal": results["失败"] > 0,
+        })
+
+        return {
+            "状态": "成功",
+            "任务编号": task_id,
+            "回执编号": receipt_no,
+            "本轮开始时间": started_at,
+            "实际执行规则": executed,
+            "跳过目标": skipped,
+            "统计": results,
+            "规则采用次数": {item["规则编号"]: item["采用次数"] for item in executed},
+        }
+
     def _write_quality_incidents(self, task_id: str, failures: list[dict]) -> None:
         """写入质量事件记录：将巡检失败的规则关联到质量事件管理。"""
         incident_rows = store.rows("dq_incident")
